@@ -13,14 +13,13 @@ import { GraphicsPath } from './path/GraphicsPath';
 import { SVGParser } from './svg/SVGParser';
 import { toFillStyle, toStrokeStyle } from './utils/convertFillInputToFillStyle';
 import { getMaxMiterRatio } from './utils/getMaxMiterRatio';
+import { HitTestSpatialIndex } from './utils/HitTestSpatialIndex';
 
 import type { PointData } from '../../../maths/point/PointData';
 import type { Shader } from '../../../rendering/renderers/shared/shader/Shader';
 import type { TextureDestroyOptions, TypeOrBool } from '../../container/destroyTypes';
 import type { ConvertedFillStyle, ConvertedStrokeStyle, FillInput, StrokeInput } from './FillTypes';
 import type { RoundedPoint } from './path/roundShape';
-
-const tmpPoint = new Point();
 
 /**
  * The mode for batching graphics instructions.
@@ -174,6 +173,12 @@ export class GraphicsContext extends EventEmitter<{
 
     private _bounds = new Bounds();
     private _boundsDirty = true;
+
+    /**
+     * Lazily built spatial index used to accelerate {@link GraphicsContext.containsPoint}.
+     * It is rebuilt whenever the context's instructions change.
+     */
+    private _hitTestIndex: HitTestSpatialIndex | null = null;
 
     /**
      * Creates a new GraphicsContext object that is a clone of this instance, copying all properties,
@@ -449,6 +454,10 @@ export class GraphicsContext extends EventEmitter<{
                 }
             }
         }
+
+        // cut() mutates an existing instruction without going through onUpdate,
+        // so the cached hit test index has to be invalidated explicitly
+        this._hitTestIndex = null;
 
         this._initNextPathLocation();
 
@@ -1080,6 +1089,7 @@ export class GraphicsContext extends EventEmitter<{
     protected onUpdate(): void
     {
         this._boundsDirty = true;
+        this._hitTestIndex = null;
         this.dirty = true;
         this.emit('update', this, 0x10);
     }
@@ -1147,6 +1157,11 @@ export class GraphicsContext extends EventEmitter<{
 
     /**
      * Check to see if a point is contained within this geometry.
+     *
+     * A spatial index is maintained so that scenes made up of thousands of
+     * individual shapes stay fast: a query only tests the shapes whose
+     * bounding box overlaps the grid cell the point falls in, rather than
+     * walking every draw instruction.
      * @param point - Point to check if it's contained.
      * @returns {boolean} `true` if the point is contained within geometry.
      */
@@ -1155,68 +1170,13 @@ export class GraphicsContext extends EventEmitter<{
         // early out if the bounding box is not hit
         if (!this.bounds.containsPoint(point.x, point.y)) return false;
 
-        const instructions = this.instructions;
-        let hasHit = false;
-
-        for (let k = 0; k < instructions.length; k++)
+        if (!this._hitTestIndex)
         {
-            const instruction = instructions[k];
-
-            const data = instruction.data as FillInstruction['data'];
-            const path = data.path;
-
-            if (!instruction.action || !path) continue;
-
-            const style = data.style;
-            const shapes = path.shapePath.shapePrimitives;
-
-            for (let i = 0; i < shapes.length; i++)
-            {
-                const shape = shapes[i].shape;
-
-                if (!style || !shape) continue;
-
-                const transform = shapes[i].transform;
-
-                const transformedPoint = transform ? transform.applyInverse(point, tmpPoint) : point;
-
-                if (instruction.action === 'fill')
-                {
-                    hasHit = shape.contains(transformedPoint.x, transformedPoint.y);
-                }
-                else
-                {
-                    const strokeStyle = (style as ConvertedStrokeStyle);
-
-                    hasHit = shape.strokeContains(transformedPoint.x, transformedPoint.y, strokeStyle.width, strokeStyle.alignment);
-                }
-
-                const holes = data.hole;
-
-                if (holes)
-                {
-                    const holeShapes = holes.shapePath?.shapePrimitives;
-
-                    if (holeShapes)
-                    {
-                        for (let j = 0; j < holeShapes.length; j++)
-                        {
-                            if (holeShapes[j].shape.contains(transformedPoint.x, transformedPoint.y))
-                            {
-                                hasHit = false;
-                            }
-                        }
-                    }
-                }
-
-                if (hasHit)
-                {
-                    return true;
-                }
-            }
+            this._hitTestIndex = new HitTestSpatialIndex();
+            this._hitTestIndex.update(this.instructions);
         }
 
-        return hasHit;
+        return this._hitTestIndex.containsPoint(point);
     }
 
     /** Unloads the GPU data from the graphics context. */
@@ -1280,5 +1240,7 @@ export class GraphicsContext extends EventEmitter<{
         this._stateStack = null;
         this.customShader = null;
         this._transform = null;
+        this._hitTestIndex?.clear();
+        this._hitTestIndex = null;
     }
 }
